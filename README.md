@@ -67,7 +67,7 @@ Settings are stored in NVS, so they survive reflashing. The portal returns autom
 
 ## Supported hardware
 
-- **Microcontroller**: ESP32-S3 with USB OTG (M5Stack AtomS3, ESP32-S3-DevKitC, and similar). 4MB flash minimum, required by the A/B OTA layout.
+- **Microcontroller**: ESP32-S3 with USB OTG (M5Stack AtomS3, ESP32-S3-DevKitC, and similar). 4MB flash minimum, required by the A/B OTA layout. **An ESP32-C3 cannot work**: its USB peripheral is serial/JTAG only and has no host mode, so no firmware can talk to a UPS through it. The ESP32-S3-Zero is the most tested board.
 - **UPS**: any UPS implementing the **HID Power Device Class** (USB Usage Page `0x84`). There is no vendor or product ID list: a board reads the descriptor and keeps the device if it declares that page. Tested on APC Back-UPS XS 1000M (`051D:0002`) and Smart-UPS C 1500 (`051D:0003`).
 - **USB connection**: USB OTG on GPIO19 (D-) and GPIO20 (D+).
 
@@ -83,6 +83,8 @@ Settings are stored in NVS, so they survive reflashing. The portal returns autom
 | GND (black) | GND |
 
 > **Powering (important)**: the APC UPS USB port is a **5V sink**. It expects VBUS to be supplied to it and outputs no power, so you cannot power the ESP32-S3 from the UPS. Power the board externally (USB-C 5V and GND) and route that same 5V to the UPS `VCC` pin so the UPS USB interface comes up. That is one 5V source feeding both, not two. Tie all grounds together (external GND, board GND, UPS GND); a common ground is required for USB HID to enumerate.
+
+> **Dual USB-C boards (ESP32-S3-DevKitC-1 and clones)**: plugging the UPS cable into the board's native USB-C port is not enough on its own. These boards feed that port's 5V *into* the board through a diode, so the port puts out no power and the UPS never attaches. The Raw HID page then shows "nothing attached to the USB host port" even with a good cable. Some of these boards have an `IN-OUT` (or `USB-OTG`) solder pad near the connectors; bridging it sends 5V out of the port. Otherwise wire 5V to the UPS as in the table above. Single-port boards such as the ESP32-S3-Zero do not have this problem.
 
 > **Note**: most ESP32-S3 dev boards expose the USB OTG pins on a dedicated connector. If your board uses the USB OTG port for programming over USB-CDC, you may need a hub or OTG adapter.
 
