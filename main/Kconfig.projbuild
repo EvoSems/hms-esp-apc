@@ -1,0 +1,83 @@
+menu "APC UPS Configuration"
+
+    # Credentials are intentionally blank. A board with no WiFi SSID boots into
+    # the SoftAP config portal (APC-XXXX / 192.168.4.1) and is provisioned there;
+    # what you save is stored in NVS and survives reflashing. Set these only if
+    # you are building a pre-provisioned image, and do not commit real values.
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default ""
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default ""
+
+    config MQTT_BROKER_URL
+        string "MQTT Broker URL"
+        default ""
+
+    config MQTT_USERNAME
+        string "MQTT Username"
+        default ""
+
+    config MQTT_PASSWORD
+        string "MQTT Password"
+        default ""
+
+    config UPS_POLL_INTERVAL_MS
+        int "UPS Poll Interval (ms)"
+        range 1000 60000
+        default 5000
+
+    config MQTT_PUBLISH_INTERVAL_MS
+        int "MQTT Publish Interval (ms)"
+        range 5000 300000
+        default 60000
+
+    config WIFI_PS_NONE
+        bool "Disable WiFi power save permanently (faster, ~40-80mA more)"
+        default n
+        help
+          The IDF default (WIFI_PS_MIN_MODEM) sleeps the radio between DTIM
+          beacons. Measured on these boards: ~81ms LAN round trip and only
+          18-76 KB/s, which is why a ~1MB OTA crawls.
+
+          Leaving this off keeps the low idle draw and instead lifts power save
+          only for the duration of an OTA upload, which is when throughput
+          actually matters. Turn it on if the board is mains-powered and you
+          want consistently low latency, at the cost of continuous extra draw
+          and heat inside a UPS case.
+
+    # Status LED. Only the addressable RGB pixel is software-driveable on these
+    # boards; any red power LED or blue charge LED is hardwired, so every colour
+    # this firmware shows comes from the WS2812.
+    #
+    # THE PIN DIFFERS PER BOARD and there is no way to detect it — binding the
+    # wrong GPIO succeeds silently and simply lights nothing:
+    #   ESP32-S3-Zero                 GPIO21   (the default below)
+    #   ESP32-S3-DevKitC-1 v1.0       GPIO48   see sdkconfig.n8r8.defaults
+    #   ESP32-S3-DevKitC-1 v1.1       GPIO38
+    #   ESP32-S3 SuperMini            GPIO48
+
+    config STATUS_LED_ENABLED
+        bool "Enable status LED"
+        default y
+
+    config STATUS_LED_GPIO
+        int "Status LED GPIO"
+        depends on STATUS_LED_ENABLED
+        range 0 48
+        default 21
+
+    config STATUS_LED_WS2812
+        bool "LED is an addressable WS2812 (not a plain GPIO LED)"
+        depends on STATUS_LED_ENABLED
+        default y
+
+    config STATUS_LED_ACTIVE_LOW
+        bool "Plain LED is active low (wired to VCC)"
+        depends on STATUS_LED_ENABLED && !STATUS_LED_WS2812
+        default n
+
+endmenu

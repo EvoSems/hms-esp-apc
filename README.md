@@ -1,0 +1,442 @@
+# hms-esp-apc
+
+*A Smart Home Maestro™ project.*
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-%23FFDD00.svg?logo=buy-me-a-coffee)](https://www.buymeacoffee.com/aamat09)
+
+**An ESP32-S3 that speaks USB HID to your APC UPS directly and publishes 30+ entities to Home Assistant. No NUT, no apcupsd, no host machine.**
+
+Plug the board into the UPS, join its setup WiFi, type your credentials once, and the UPS appears in Home Assistant. Nothing else runs anywhere.
+
+The UPS arrives in Home Assistant as a single device with every metric as its own entity, discovered automatically, no YAML to write.
+
+![The UPS in Home Assistant, one device with every metric as an entity](docs/images/home-assistant.png)
+
+Everything is configurable from the board itself in a browser: WiFi, MQTT, publish interval, device naming, and firmware updates.
+
+![The board's web configuration UI, including the firmware update card](docs/images/web-ui.png)
+
+The status page shows live metrics next to the HID decode as it happens, which is what you want when bringing up a UPS model for the first time.
+
+![The live status page, showing metrics and the HID decode log](docs/images/status-page.png)
+
+
+This firmware decodes the HID report descriptor **on the microcontroller**. At enumeration it reads the descriptor the UPS itself provides, builds a table of every field with its report ID, bit offset, bit size and unit exponent, and drives decoding from HID usage paths. It resolves usages to real units and produces finished values: battery runtime in seconds, load as a percentage, the reason for the last transfer to battery. What leaves the chip is already Home Assistant entities.
+
+Because the layout comes from the device rather than from hardcoded offsets, **any UPS that implements the HID Power Device Class correctly is decoded without new code**. There is no vendor ID table to extend. A board admits any HID device, then keeps it only if its descriptor declares Usage Page `0x84`.
+
+The practical result: no server to keep running, no daemon to configure, no parsing layer to maintain. The microcontroller is the entire stack.
+
+### Monitoring several UPS units together
+
+One board handles one UPS, and Home Assistant will happily show any number of them side by side. If you want a single place to read your whole home's backup power at a glance, [**hms-nut**](https://github.com/hms-homelab/hms-nut) is the companion service for it: a C++ microservice that aggregates every UPS in the house, keeps history in PostgreSQL, and serves its own Angular dashboard.
+
+What that dashboard gives you over per-device entities:
+
+- **A fleet roll-up**, every configured node on one screen, with per-node battery and load meters, 24 hour trend sparklines, and a last-seen indicator.
+- **Charts over any stored metric and any range**, plus cross-node comparison that overlays one metric across every monitored unit, so you can see input voltage across the whole house over seven days on a single chart.
+- **An AI written daily summary of the entire home.** Once a day the service feeds the previous day's aggregates for every device to an LLM and writes a plain language summary of your energy and power events. Summaries are kept, so the card shows the latest with earlier days behind a toggle. The backend is pluggable: Ollama for fully local, or OpenAI, Gemini, or Anthropic.
+
+It matters here because it reads this firmware's MQTT directly. Set `NUT_ENABLED=false` and it treats ESP32 monitors as first class sources, so you get fleet history, charts, and the daily summary with no NUT daemon anywhere, and no Home Assistant either if you do not want one. It can also poll a real `upsd` alongside, which is useful when some units are on NUT already and some are running this firmware.
+
+The two are independent. Use this firmware alone for a Home Assistant setup, add hms-nut when you outgrow one UPS or want a single dashboard for the whole house.
+
+## Features
+
+- USB HID host communication with the UPS, with the report descriptor parsed on-device
+- **Vendor independent**: decoding is driven by the device's own descriptor, so any conformant HID Power Device Class UPS works without a code change
+- **Raw HID capture at `/hid`**: descriptor, live reports and the decoded field table, which also identifies UPS models this firmware has never seen
+- 30+ Home Assistant entities via MQTT auto-discovery, no YAML required
+- **SoftAP captive portal** for setup: no credentials compiled into the firmware
+- **Web config UI** for WiFi, MQTT, publish interval, and device naming, persisted to NVS
+- **OTA firmware updates** over the network, with an A/B partition layout
+- Live status and log page at `/status`
+- Editable device identity: friendly name and MQTT device ID slug
+- Automatic reconnection for both WiFi and MQTT
+- Falls back to simulated data when no UPS is attached, for development
+
+## Quick start
+
+1. Flash the firmware once over USB (see [Build and flash](#build-and-flash)).
+2. On first boot the board finds no saved config and raises an open access point named **`APC-XXXX`** (last two bytes of its MAC).
+3. Join that network from a phone or laptop. A sign-in page opens automatically. If it does not, browse to **`http://192.168.4.1/`**; every hostname resolves there.
+4. Enter your WiFi and MQTT details, then save. The board reboots and joins your network.
+5. The UPS appears in Home Assistant under **APC UPS (MAC)**, or whatever friendly name you set.
+
+Settings are stored in NVS, so they survive reflashing. The portal returns automatically if the saved network ever stops accepting the board, which means a router change never requires a USB cable.
+
+## Supported hardware
+
+- **Microcontroller**: ESP32-S3 with USB OTG (M5Stack AtomS3, ESP32-S3-DevKitC, and similar). 4MB flash minimum, required by the A/B OTA layout. **An ESP32-C3 cannot work**: its USB peripheral is serial/JTAG only and has no host mode, so no firmware can talk to a UPS through it. The ESP32-S3-Zero is the most tested board.
+- **UPS**: any UPS implementing the **HID Power Device Class** (USB Usage Page `0x84`). There is no vendor or product ID list: a board reads the descriptor and keeps the device if it declares that page. Tested on APC Back-UPS XS 1000M (`051D:0002`) and Smart-UPS C 1500 (`051D:0003`).
+- **USB connection**: USB OTG on GPIO19 (D-) and GPIO20 (D+).
+
+> Not every UPS with a USB port qualifies. Many budget units expose a USB-to-serial bridge (Cypress `0665:5161` is the common one) that enumerates as HID but carries Megatec/Q1 ASCII rather than any Power Device data. Those cannot be decoded by this firmware. [Reading the raw HID](#reading-the-raw-hid) tells you which kind you have in about ten seconds.
+
+### Wiring
+
+| UPS USB | ESP32-S3 |
+|---------|----------|
+| D- (white) | GPIO19 |
+| D+ (green) | GPIO20 |
+| VCC (red) | 5V |
+| GND (black) | GND |
+
+> **Powering (important)**: the APC UPS USB port is a **5V sink**. It expects VBUS to be supplied to it and outputs no power, so you cannot power the ESP32-S3 from the UPS. Power the board externally (USB-C 5V and GND) and route that same 5V to the UPS `VCC` pin so the UPS USB interface comes up. That is one 5V source feeding both, not two. Tie all grounds together (external GND, board GND, UPS GND); a common ground is required for USB HID to enumerate.
+
+> **Dual USB-C boards (ESP32-S3-DevKitC-1 and clones)**: plugging the UPS cable into the board's native USB-C port is not enough on its own. These boards feed that port's 5V *into* the board through a diode, so the port puts out no power and the UPS never attaches. The Raw HID page then shows "nothing attached to the USB host port" even with a good cable. Some of these boards have an `IN-OUT` (or `USB-OTG`) solder pad near the connectors; bridging it sends 5V out of the port. Otherwise wire 5V to the UPS as in the table above. Single-port boards such as the ESP32-S3-Zero do not have this problem.
+
+> **Note**: most ESP32-S3 dev boards expose the USB OTG pins on a dedicated connector. If your board uses the USB OTG port for programming over USB-CDC, you may need a hub or OTG adapter.
+
+### What it looks like built
+
+<!-- Drop the photos into docs/images/, write a line above each, and uncomment.
+
+![](docs/images/board-wiring.jpg)
+
+![](docs/images/installed.jpg)
+-->
+
+The link to the UPS and the board's own 5V supply are separate things, and the UPS port supplies nothing, so the board is powered externally with that same 5V routed to the UPS `VCC` pin as described above.
+
+## Configuration
+
+### Through the web UI (recommended)
+
+Browse to the board's IP address on your network, or `http://192.168.4.1/` while the setup portal is up. Everything is editable there and saved to NVS:
+
+| Setting | Notes |
+|---------|-------|
+| WiFi SSID and password | Saving a wrong SSID is recoverable: the portal comes back |
+| MQTT broker URL | For example `mqtt://192.168.1.100` |
+| MQTT username and password | Optional, leave blank if your broker is open |
+| Publish interval | 5 to 300 seconds, default 60 |
+| Device name | Home Assistant display name, blank gives `APC UPS (MAC)` |
+| Device ID slug | MQTT device id `apc_ups_<slug>`, blank gives the MAC |
+
+NVS always wins over anything compiled in.
+
+### Through menuconfig (optional)
+
+`idf.py menuconfig` under **APC UPS Configuration** still exists, for building a pre-provisioned image.
+
+| Setting | Default |
+|---------|---------|
+| WiFi SSID | *(blank)* |
+| WiFi Password | *(blank)* |
+| MQTT Broker URL | *(blank)* |
+| MQTT Username | *(blank)* |
+| MQTT Password | *(blank)* |
+| UPS Poll Interval | 5000 ms |
+| MQTT Publish Interval | 60000 ms |
+
+
+
+```bash
+# sdkconfig.local.defaults  (add to .gitignore)
+CONFIG_WIFI_SSID="my-network"
+CONFIG_WIFI_PASSWORD="my-password"
+
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.local.defaults" build
+```
+
+## Build and flash
+
+### From a browser, with nothing installed
+
+**[hms-homelab.github.io/hms-esp-apc](https://hms-homelab.github.io/hms-esp-apc/)**
+
+Plug the board into any computer, open that page in Chrome or Edge, pick your
+board and click the button. Nothing to install, no toolchain, no clone. It
+flashes the newest release over Web Serial, entirely in the browser — no
+firmware or credentials touch a server.
+
+This is the easiest route by a wide margin, and the one to send someone else.
+Both board profiles are offered, prebuilt:
+
+| Board | Status LED | Image |
+|---|---|---|
+| ESP32-S3-DevKitC-1 (N8R8) | GPIO48 | `hms-esp-apc-<version>-n8r8-merged.bin` |
+| ESP32-S3-Zero | GPIO21 | `hms-esp-apc-<version>-merged.bin` |
+
+Picking the wrong one leaves the LED dark and changes nothing else, so it is
+worth a second look but not worth worrying about.
+
+### On a Mac, with nothing installed
+
+Use this if you want to flash a modified tree rather than a release.
+Double-click `scripts/flash-mac.command`, or run it from a terminal:
+
+```bash
+bash scripts/flash-mac.command
+```
+
+It installs everything the build needs, builds the firmware, finds the board on
+USB and flashes it, then tells you how to get it onto WiFi. The first run
+downloads about 2GB and takes 15-30 minutes; after that it takes a minute. It is
+safe to run again — every step checks whether it already did its work.
+
+The board has two USB-C ports. **Flash through the one labelled USB**; it goes
+through a separate bridge chip and works whatever the firmware is doing. The
+other port is wired to the ESP32-S3 itself and the firmware claims it for the
+UPS, so plug the UPS into that one afterwards.
+
+If nothing appears, try the other port — some clones have the two labels printed
+the wrong way round. Identify them by USB vendor rather than by the silkscreen:
+`0x1A86` (WCH) or `0x10C4` (SiLabs) is the bridge and is the one to flash
+through, `0x303A` (Espressif) is the native port that becomes the UPS
+connection. Both enumerate under similar device names, so the name alone does
+not tell them apart.
+
+This script targets the ESP32-S3 **N8R8** board profile
+(`sdkconfig.n8r8.defaults`), which differs from the repository default only in
+which pin drives the status LED. For any other board, build by hand below.
+
+### By hand
+
+Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/) v5.3 or later, an MQTT broker, and Home Assistant with the MQTT integration enabled.
+
+```bash
+git clone https://github.com/hms-homelab/hms-esp-apc.git
+cd hms-esp-apc
+
+idf.py build
+idf.py -p PORT flash
+```
+
+Then follow [Quick start](#quick-start). No menuconfig step is needed.
+
+> **The serial port disappears after boot.** On the ESP32-S3, GPIO19 and GPIO20 are the same pins backing USB-Serial/JTAG. When the firmware starts the USB host stack it takes that peripheral, and the serial port vanishes from your machine. That is why there is a **10 second boot delay** before USB host initialisation: it is your window to start a reflash. If you miss it, hold **BOOT** and tap **RESET** to enter download mode, where the port stays up indefinitely.
+
+### Updating over the air
+
+Once a board is running, firmware updates need no cable:
+
+1. Open the board's web UI and use the **Firmware Update** card, or
+2. `curl -X POST --data-binary @build/apc_usb_mqtt_bridge.bin http://<device-ip>/ota`
+
+The image is written to the inactive OTA slot, verified, and the board reboots into it.
+
+> The **first** OTA-capable image has to be flashed over USB once per board, because it is what lays down the A/B partition table. Earlier single-app builds have nowhere to stage an update.
+
+> **Expect the upload to be slow, and let it finish.** WiFi power save is left at the ESP-IDF default, so the radio sleeps between beacons. Measured on two units: no packet loss, but around 81ms of LAN round trip and download rates between 18 and 76 KB/s depending on placement. A 1MB image can therefore take minutes rather than seconds. The HTTP server allows 300 seconds per socket operation to accommodate this, so a transfer that looks stalled is usually just slow. If it fails part way through, the running firmware is untouched: the image is staged in the inactive slot and only becomes bootable once it verifies.
+
+## Home Assistant entities
+
+Sensors appear automatically under a device named **APC UPS (MAC)**, or your chosen friendly name.
+
+### Battery
+| Entity | Unit | Description |
+|--------|------|-------------|
+| Battery Charge | % | Current battery charge level |
+| Battery Voltage | V | Current battery voltage |
+| Battery Nominal Voltage | V | Configured battery voltage, for example 12V |
+| Battery Runtime | s | Estimated runtime on battery |
+| Battery Low Runtime | s | Low runtime threshold |
+| Battery Low Charge | % | Low charge threshold |
+| Battery Warning Charge | % | Warning charge threshold |
+| Battery Type | n/a | Chemistry, for example PbAc |
+| Battery Manufacture Date | n/a | Battery manufacture date |
+
+### Input power
+| Entity | Unit | Description |
+|--------|------|-------------|
+| Input Voltage | V | Current input (mains) voltage |
+| Input Nominal Voltage | V | Configured nominal voltage, for example 120V |
+| Low Voltage Transfer | V | Switch to battery below this voltage |
+| High Voltage Transfer | V | Switch to battery above this voltage |
+| Input Sensitivity | n/a | Sensitivity setting: low, medium, high |
+| Last Transfer Reason | n/a | Why the UPS last switched to battery |
+
+### Output and load
+| Entity | Unit | Description |
+|--------|------|-------------|
+| Load | % | Current load as a percentage of capacity |
+| Nominal Power | W | Rated power capacity, for example 600W |
+
+### Status and timers
+| Entity | Unit | Description |
+|--------|------|-------------|
+| UPS Status | n/a | OL (online), OB (on battery), CHRG, LB, and so on |
+| Beeper Status | n/a | enabled, disabled, muted |
+| Reboot Delay | s | Configured delay before reboot |
+| Reboot Timer | s | Active reboot countdown, -1 when inactive |
+| Shutdown Timer | s | Active shutdown countdown, -1 when inactive |
+| Self-Test Result | n/a | Last self-test outcome |
+
+### Device info
+| Entity | Description |
+|--------|-------------|
+| Driver Name | `esp32-usb-hid` |
+| Driver Version | Driver version string |
+| Driver State | `running` |
+| Power Failure | `OK`, or the failure reason |
+
+## Reading the raw HID
+
+Every board publishes what it sees on the USB bus at `/hid`, as plain text so it can be curl'd, saved and diffed:
+
+```bash
+curl http://<device-ip>/hid
+```
+
+| Section | What it gives you |
+|---------|-------------------|
+| **Attached device** | VID:PID, and whether the device declares HID Usage Page `0x84` |
+| **HID report descriptor** | The raw descriptor, hex dumped. The device's own definition of every report |
+| **Raw reports** | The last payload seen per report ID, with source (interrupt or feature), age, and a changed flag |
+| **Parsed fields** | Every field the descriptor declares: report ID, bit offset, bit size, unit exponent, usage path, and the metric it maps to |
+| **Decoded** | The finished values and status flags |
+
+This is the first thing to reach for when a reading looks wrong. A bad value and a bad bit position look identical from Home Assistant, and this page separates them: the descriptor says where a field really lives, the raw bytes say what actually arrived.
+
+### Identifying a UPS this firmware has never seen
+
+Plug any UPS into a board and read `/hid`. It does not have to work first, and you need neither NUT nor a PC in the loop.
+
+- **`power device = yes (declares HID Usage Page 0x84)`** means it implements the class and should decode with no code change. The parsed field table shows exactly which metrics it exposes.
+- **`power device = no`** means it enumerated as HID but carries no Power Device data. Almost always a USB-to-serial bridge speaking Megatec/Q1. The board releases it rather than polling it forever, and says so in the log.
+- **`(nothing attached to the USB host port)`** means nothing enumerated at all: check the cable and the VBUS wiring above.
+
+In every case the VID:PID and the raw descriptor stay on the page, which is enough to identify the device and decide what supporting it would take. That works for a UPS from any vendor, including ones that turn out not to be supportable.
+
+### Replaying a capture on a PC
+
+A saved `/hid` page can be pushed back through the same decoder on a host machine, with no board involved:
+
+```bash
+curl http://<device-ip>/hid > capture.txt
+
+cd test
+python3 extract_hid.py ../capture.txt cap/
+cc -Wall -Wextra -I../main -o /tmp/replay hid_replay.c ../main/hid_pdc.c ../main/ups_map.c
+/tmp/replay cap/descriptor.bin cap/reports.txt
+```
+
+That prints the parsed field table and the decoded metrics for the captured device, which is how a new model gets verified before any firmware change is flashed. A capture keeps working after the UPS is unplugged, so a model can be supported without keeping the hardware on hand.
+
+The decoder's own test suite runs the same way, no board required:
+
+```bash
+cd test
+cc -Wall -Wextra -I../main -o /tmp/t hid_pdc_test.c ../main/hid_pdc.c ../main/ups_map.c && /tmp/t
+```
+
+## Architecture
+
+FreeRTOS tasks:
+
+1. **USB host task**: manages the USB host stack, receives interrupt transfers (the UPS pushes status changes on its own), and polls feature reports for voltage, load, and thresholds on a configurable interval.
+2. **MQTT publish task**: sends Home Assistant discovery configs at startup, then publishes the shared metrics struct on the publish interval.
+3. **HTTP server**: serves the config UI, `/status`, `POST /save`, and `POST /ota`. In portal mode it also answers every unmatched URL with a redirect to the config page, which is what makes phones pop the sign-in sheet.
+4. **DNS hijack**: only in portal mode. Answers every A query with `192.168.4.1`.
+5. **WiFi manager**: STA connection with retry, and the SoftAP fallback that raises the portal.
+
+### Boot logic
+
+```
+boot
+ |
+ +-- NVS holds a WiFi SSID?
+       |
+       no --> SoftAP portal: open AP "APC-XXXX", DNS catch-all, config page
+       |
+       yes -> join the network
+                |
+                +-- joined      --> MQTT + USB host, normal operation
+                +-- 10 failures --> SoftAP portal
+```
+
+### Data flow
+
+```
+UPS (USB device)
+  |
+  | at enumeration: HID report descriptor
+  v
+hid_pdc  (walks the descriptor)   -->  field table: report id, usage path,
+  |                                    bit offset, bit size, unit exponent
+  | USB HID reports (interrupt + feature)
+  v
+USB host manager --> ups_map (usage path -> metric) --> ups_metrics_t
+                                              |
+                                              v
+                                    MQTT publish task --> broker --> Home Assistant
+```
+
+The feature reports polled are derived from the descriptor too, so a board asks each UPS only for what that UPS actually offers.
+
+## Known hardware limitations
+
+- **Input frequency**: the Back-UPS XS 1000M reports 0 Hz. This looks like a hardware limitation.
+- **Output voltage**: line-interactive models do not measure it separately, so it mirrors input voltage.
+- **Firmware version**: not exposed over HID on the tested models.
+- **Battery date encoding**: reported as a raw day count, and the decoding varies by model.
+
+## Contributing
+
+Contributions are welcome. Please open an issue or a pull request.
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/my-change`)
+3. Commit your changes
+4. Push the branch and open a Pull Request
+
+## Disclaimer
+
+This firmware is provided as is, without warranty of any kind, express or implied. You use it at your own risk, and the author accepts no responsibility or liability for any direct, indirect, incidental, or consequential damage, loss, or injury arising from its use or misuse.
+
+Two specific risks are worth stating plainly, because this project involves your mains power equipment:
+
+- **A UPS is not a safe thing to open.** It contains mains voltage, a sealed lead-acid battery capable of very high short-circuit current, and capacitors that stay charged after it is unplugged. Mounting a board inside one is entirely your decision and your risk. Nothing here requires you to open the case; the board works just as well sitting outside it.
+- **Wrong wiring can destroy hardware.** Feeding voltage to the wrong pin can damage the ESP32-S3, the UPS USB interface, or both. Verify the connections against your own board's pinout before powering anything up. Doing any of this will likely void your UPS warranty.
+
+The `hms-` prefix marks this as part of [Home Management System](https://github.com/hms-homelab), a framework for fully local, private home automation aimed at self sufficiency. Smart Home Maestro™ is a trademark of the author, with a registration application pending.
+
+This project is not affiliated with, endorsed by, or connected to APC or Schneider Electric. APC, Back-UPS, and Smart-UPS are trademarks of their respective owners, used here only to describe compatibility.
+
+---
+
+## Support
+
+If this project is useful to you, consider buying me a coffee.
+
+[![Buy Me A Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/aamat09)
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+
+## SRT2200XLI audit notes (2026-10-19)
+
+The v1.16.7 source includes regression coverage for the latest observed live samples: battery charge `94%` (`0C 5E 00`), runtime `40703 s` (`0D FF 9E 00 00`), battery voltage `82.31 V`, and nominal battery voltage `72.00 V`. Model-rated input voltage (`230 V`) and rated output power (`1980 W`) are static specifications; measured input voltage and load percentage remain unknown pending vendor-report evidence.
+
+Native host tests do not replace an ESP-IDF build or a physical UPS flash/test. Those checks remain outstanding.
+
+
+### SRT2200XLI model identity and fields that need vendor-report evidence
+
+For the APC Smart-UPS SRT2200XLI target, Home Assistant discovery now falls back
+to `Smart-UPS SRT2200XLI` instead of the unrelated `Back-UPS XS 1000M`. When the
+USB product string is stale, firmware only overrides it if the connected APC
+`051D:0003` descriptor matches the SRT2200XLI standard-report signature. Discovery
+waits briefly for USB identity reads so retained device metadata is more likely to
+contain the corrected model on first publication.
+
+The supplied 449-byte descriptor does not expose standard measured input voltage,
+load percentage, or active-power usages. The confirmed model's nominal input voltage
+(230 V) and rated output power (1980 W) are populated as static specifications from
+[Schneider Electric's SRT2200XLI specification](https://www.se.com/za/en/product/SRT2200XLI/smartups-srt-2200va-230v/),
+not as live measurements. To add the missing live fields,
+collect `/hid` raw reports for the vendor-specific report IDs while the UPS is in
+known states (normal mains, battery test/transfer, and preferably changing load),
+then correlate the payload bytes with the known changes. Native tests are not a
+substitute for an ESP-IDF build or a post-flash check on the actual UPS.
+
+
+### v1.16.8 vendor-report capture improvement (2026-10-19)
+
+The descriptor-derived Feature polling list previously included only fields with a known semantic mapping. That excluded the SRT2200XLI's vendor-specific Feature report IDs, including `0x96` (Usage Page `0xFF86`, Usage `0xF1`, 63-byte payload), so `/hid` could not show their responses. The poll list now includes every Feature report ID declared in the descriptor, while decoding remains limited to verified mappings. Raw report storage now keeps 64 bytes, enough for the report ID plus a full 63-byte payload.
+
+This is a diagnostic-enabling fix, not yet a live input-voltage/load decoder. Unknown vendor payloads must be correlated with known UPS conditions before mapping them to measurements. The `/hid` page will show the raw `FEAT` bytes after the first polling cycle; save a capture in normal mains operation and another during a known load or battery-state change.

@@ -1,0 +1,437 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_random.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "mqtt_client.h"
+
+#include "wifi_manager.h"
+#include "mqtt_manager.h"
+#include "apc_hid_parser.h"
+#include "usb_host_manager.h"
+#include "http_server.h"
+#include "led_status.h"
+#include "version.h"
+
+static const char *TAG = "main";
+static app_config_t app_config;
+
+// Task to publish UPS metrics periodically
+static void mqtt_publish_task(void *arg)
+{
+    ESP_LOGI(TAG, "📊 MQTT publish task started");
+
+    // Wait for MQTT connection
+    while (!mqtt_is_connected()) {
+        ESP_LOGI(TAG, "Waiting for MQTT connection...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    /* USB enumeration and the identity string requests run in another task.
+     * Give them time to finish before retaining Home Assistant device metadata;
+     * otherwise discovery can permanently retain the old fallback model until
+     * the next reconnect/restart. The fallback is correct for this target model
+     * if identity retrieval still fails. */
+    const int identity_wait_limit_ms = 15000;
+    int identity_waited_ms = 0;
+    while (apc_hid_get_metrics()->ups_model[0] == '\0' &&
+           identity_waited_ms < identity_wait_limit_ms) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        identity_waited_ms += 250;
+    }
+    /* Allow the remaining USB string descriptors and model-signature correction
+     * to complete after the model field first appears. */
+    if (apc_hid_get_metrics()->ups_model[0] != '\0') {
+        vTaskDelay(pdMS_TO_TICKS(1500));
+    }
+
+    // Publish Home Assistant discovery configs
+    ESP_LOGI(TAG, "📡 Publishing MQTT discovery configs...");
+    ESP_LOGI(TAG, "💡 Each UPS bridge has unique device ID based on MAC address");
+
+    // Battery metrics
+    mqtt_publish_discovery("battery_charge", "Battery Charge", "%", "battery");
+    mqtt_publish_discovery("battery_voltage", "Battery Voltage", "V", "voltage");
+    mqtt_publish_discovery("battery_voltage_nominal", "Battery Nominal Voltage", "V", "voltage");
+    mqtt_publish_discovery("battery_runtime", "Battery Runtime", "s", "duration");
+    mqtt_publish_discovery("battery_runtime_low", "Battery Low Runtime", "s", "duration");
+    mqtt_publish_discovery("battery_charge_low", "Battery Low Charge", "%", "battery");
+    mqtt_publish_discovery("battery_charge_warning", "Battery Warning Charge", "%", "battery");
+    mqtt_publish_discovery("battery_type", "Battery Type", NULL, NULL);
+    mqtt_publish_discovery("battery_mfr_date", "Battery Manufacture Date", NULL, NULL);
+
+    // Input power metrics
+    mqtt_publish_discovery("input_voltage", "Input Voltage", "V", "voltage");
+    mqtt_publish_discovery("input_voltage_nominal", "Input Nominal Voltage", "V", "voltage");
+    // NOTE: input_frequency not available - UPS reports 0 Hz (hardware limitation)
+    // mqtt_publish_discovery("input_frequency", "Input Frequency", "Hz", "frequency");
+    mqtt_publish_discovery("input_transfer_low", "Low Voltage Transfer", "V", "voltage");
+    mqtt_publish_discovery("input_transfer_high", "High Voltage Transfer", "V", "voltage");
+    mqtt_publish_discovery("input_sensitivity", "Input Sensitivity", NULL, NULL);
+    mqtt_publish_discovery("input_transfer_reason", "Last Transfer Reason", NULL, NULL);
+
+    // Output/Load metrics
+    // NOTE: output_voltage not available - line-interactive UPS doesn't measure output (hardware limitation)
+    // mqtt_publish_discovery("output_voltage", "Output Voltage", "V", "voltage");
+    mqtt_publish_discovery("load_percent", "Load", "%", NULL);
+    mqtt_publish_discovery("nominal_power", "Nominal Power", "W", "power");
+
+    // UPS status and timers
+    mqtt_publish_discovery("status", "UPS Status", NULL, NULL);
+    mqtt_publish_discovery("beeper_status", "Beeper Status", NULL, NULL);
+    mqtt_publish_discovery("delay_shutdown", "Shutdown Delay", "s", "duration");
+    mqtt_publish_discovery("delay_reboot", "Reboot Delay", "s", "duration");
+    mqtt_publish_discovery("self_test_result", "Self-Test Result", NULL, NULL);
+
+    // Device information
+    // Now available: fetched from USB string descriptor 7 (APC_UPS_FirmwareRevision)
+    mqtt_publish_discovery("firmware_version", "Firmware Version", NULL, NULL);
+    mqtt_publish_discovery("ups_serial", "Serial Number", NULL, NULL);
+    mqtt_publish_discovery("driver_name", "Driver Name", NULL, NULL);
+    mqtt_publish_discovery("driver_version", "Driver Version", NULL, NULL);
+    mqtt_publish_discovery("driver_state", "Driver State", NULL, NULL);
+    mqtt_publish_discovery("power_failure", "Power Failure", NULL, NULL);
+
+    /* The supplied SRT2200XLI descriptor does not declare standard measured
+     * Input.Voltage, PercentLoad, transfer-point, sensitivity or self-test
+     * usages. Clear retained states left by older firmware instead of showing
+     * stale values or false zeroes. Model-rated nominal input voltage and rated
+     * output power are populated from the confirmed model specification. */
+    const char *unsupported_sensors[] = {
+        "input_voltage", "input_transfer_low", "input_transfer_high",
+        "input_sensitivity", "input_transfer_reason", "load_percent",
+        "shutdown_timer", "self_test_result"
+    };
+    for (size_t i = 0; i < sizeof(unsupported_sensors) / sizeof(unsupported_sensors[0]); i++) {
+        mqtt_clear_state(unsupported_sensors[i]);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    while (1) {
+        if (mqtt_is_connected()) {
+            const ups_metrics_t *metrics = apc_hid_get_metrics();
+            
+            if (metrics->valid) {
+                ESP_LOGI(TAG, "═══════════════════════════════════════════");
+                ESP_LOGI(TAG, "📤 PUBLISHING TO MQTT");
+                ESP_LOGI(TAG, "   Broker: %s", app_config.mqtt_url);
+                ESP_LOGI(TAG, "   Base Topic: homeassistant/sensor/apc_ups");
+                ESP_LOGI(TAG, "");
+
+                // Publish key metrics with detailed logging
+                ESP_LOGI(TAG, "   📊 battery_charge → %.1f%%", metrics->battery_charge);
+                mqtt_publish_metric("battery_charge", metrics->battery_charge, "%");
+
+                if (metrics->battery_runtime > 0.0f) {
+                    ESP_LOGI(TAG, "   ⏱️  battery_runtime → %.0f seconds (%.1f min)",
+                             metrics->battery_runtime, metrics->battery_runtime / 60.0f);
+                    mqtt_publish_metric("battery_runtime", metrics->battery_runtime, "s");
+                }
+
+                if (metrics->battery_voltage > 0.0f) {
+                    ESP_LOGI(TAG, "   🔋 battery_voltage → %.2fV", metrics->battery_voltage);
+                    mqtt_publish_metric("battery_voltage", metrics->battery_voltage, "V");
+                }
+
+                // Battery additional metrics
+                if (metrics->battery_nominal_voltage > 0) {
+                    mqtt_publish_metric("battery_voltage_nominal", metrics->battery_nominal_voltage, "V");
+                }
+                if (metrics->low_battery_runtime_threshold > 0) {
+                    mqtt_publish_metric("battery_runtime_low", metrics->low_battery_runtime_threshold, "s");
+                }
+                if (metrics->low_battery_charge_threshold > 0) {
+                    mqtt_publish_metric("battery_charge_low", metrics->low_battery_charge_threshold, "%");
+                }
+                if (metrics->battery_warning_threshold > 0) {
+                    mqtt_publish_metric("battery_charge_warning", metrics->battery_warning_threshold, "%");
+                }
+                if (strlen(metrics->battery_type) > 0) {
+                    mqtt_publish_string("battery_type", metrics->battery_type);
+                }
+                if (strlen(metrics->battery_mfr_date) > 0) {
+                    mqtt_publish_string("battery_mfr_date", metrics->battery_mfr_date);
+                }
+
+                // Input power additional metrics
+                if (metrics->input_voltage_nominal > 0) {
+                    mqtt_publish_metric("input_voltage_nominal", metrics->input_voltage_nominal, "V");
+                }
+                // input_frequency removed - hardware doesn't support
+                // if (metrics->input_frequency > 0) {
+                //     ESP_LOGI(TAG, "   〰️ input_frequency → %.1fHz", metrics->input_frequency);
+                //     mqtt_publish_metric("input_frequency", metrics->input_frequency, "Hz");
+                // }
+                if (metrics->low_voltage_transfer > 0) {
+                    mqtt_publish_metric("input_transfer_low", metrics->low_voltage_transfer, "V");
+                }
+                if (metrics->high_voltage_transfer > 0) {
+                    mqtt_publish_metric("input_transfer_high", metrics->high_voltage_transfer, "V");
+                }
+                if (strlen(metrics->input_sensitivity) > 0) {
+                    mqtt_publish_string("input_sensitivity", metrics->input_sensitivity);
+                }
+                if (strlen(metrics->last_transfer_reason) > 0) {
+                    mqtt_publish_string("input_transfer_reason", metrics->last_transfer_reason);
+                }
+
+                // Output/Load additional metrics
+                // output_voltage removed - hardware doesn't support
+                // if (metrics->output_voltage > 0) {
+                //     ESP_LOGI(TAG, "   ⚡ output_voltage → %.1fV", metrics->output_voltage);
+                //     mqtt_publish_metric("output_voltage", metrics->output_voltage, "V");
+                // }
+                if (metrics->nominal_power > 0) {
+                    ESP_LOGI(TAG, "   ⚡ nominal_power → %.0fW", metrics->nominal_power);
+                    mqtt_publish_metric("nominal_power", metrics->nominal_power, "W");
+                }
+
+                ESP_LOGI(TAG, "   🚦 status → %s", metrics->status_string);
+                mqtt_publish_string("status", metrics->status_string);
+
+                // UPS configuration and timers
+                if (strlen(metrics->beeper_status) > 0) {
+                    mqtt_publish_string("beeper_status", metrics->beeper_status);
+                }
+                // Reports 0x12 and 0x13 are DelayBeforeShutdown and
+                // DelayBeforeReboot on this SRT2200XLI descriptor. All-ones or
+                // short reports are ignored by the parser, so only real values
+                // greater than zero are published.
+                if (metrics->delay_before_shutdown > 0) {
+                    mqtt_publish_metric("delay_shutdown", metrics->delay_before_shutdown, "s");
+                }
+
+                // Publish delay_before_reboot (Report 0x13) - configuration value
+                if (metrics->delay_before_reboot > 0) {
+                    mqtt_publish_metric("delay_reboot", metrics->delay_before_reboot, "s");
+                }
+
+                // This SRT descriptor does not expose the legacy shutdown_timer
+                // report 0x15, so do not publish the struct's default zero.
+
+                // No reboot_timer: report 0x17 is PowerSummary.RemainingTimeLimit.
+                // DelayBeforeReboot is the separate report 0x13 above.
+
+                // Self-test result
+                if (strlen(metrics->self_test_result) > 0) {
+                    mqtt_publish_string("self_test_result", metrics->self_test_result);
+                }
+
+                // Device information
+                if (strlen(metrics->firmware_version) > 0) {
+                    mqtt_publish_string("firmware_version", metrics->firmware_version);
+                }
+                if (strlen(metrics->ups_serial) > 0) {
+                    mqtt_publish_string("ups_serial", metrics->ups_serial);
+                }
+                if (strlen(metrics->driver_name) > 0) {
+                    mqtt_publish_string("driver_name", metrics->driver_name);
+                }
+                if (strlen(metrics->driver_version) > 0) {
+                    mqtt_publish_string("driver_version", metrics->driver_version);
+                }
+                if (strlen(metrics->driver_state) > 0) {
+                    mqtt_publish_string("driver_state", metrics->driver_state);
+                }
+                if (strlen(metrics->power_failure_status) > 0) {
+                    mqtt_publish_string("power_failure", metrics->power_failure_status);
+                }
+
+                ESP_LOGI(TAG, "");
+                ESP_LOGI(TAG, "✅ MQTT PUBLISH COMPLETE");
+                ESP_LOGI(TAG, "🔋 Summary: %s | Battery: %.0f%% | Runtime: %.0f s",
+                         metrics->status_string,
+                         metrics->battery_charge,
+                         metrics->battery_runtime);
+                ESP_LOGI(TAG, "═══════════════════════════════════════════");
+            } else {
+                ESP_LOGW(TAG, "⚠️ No valid UPS metrics available");
+            }
+        } else {
+            ESP_LOGW(TAG, "⚠️ MQTT not connected, skipping publish");
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(app_config.publish_interval_ms));
+    }
+}
+
+// Simulated UPS data task (for testing without USB device)
+static void simulate_ups_data_task(void *arg)
+{
+    ESP_LOGI(TAG, "🧪 Simulated UPS data task started (for testing)");
+    
+    ups_metrics_t test_metrics = {
+        .battery_charge = 100.0f,
+        .battery_voltage = 13.7f,
+        .battery_runtime = 2420.0f,
+        .input_voltage = 121.0f,
+        .load_percent = 14.0f,
+        .status = {
+            .online = true,
+            .discharging = false,
+            .charging = false,
+            .low_battery = false,
+        },
+        .valid = true,
+    };
+    
+    apc_hid_format_status(&test_metrics.status, test_metrics.status_string, 
+                         sizeof(test_metrics.status_string));
+    
+    while (1) {
+        // Simulate slight variations
+        test_metrics.battery_charge = 95.0f + (esp_random() % 6);
+        test_metrics.load_percent = 10.0f + (esp_random() % 10);
+        test_metrics.input_voltage = 118.0f + ((esp_random() % 5) * 0.5f);
+        
+        // Update metrics
+        apc_hid_parse_report(0x0C, (uint8_t*)&test_metrics, sizeof(test_metrics), &test_metrics);
+        
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_UPS_POLL_INTERVAL_MS));
+    }
+}
+
+// Build timestamp - updated on every compile
+#define BUILD_TIMESTAMP __DATE__ " " __TIME__
+#define FIRMWARE_VERSION HMS_ESP_APC_VERSION
+
+/* The ones that actually distinguish a healthy restart from a crash. PANIC,
+   INT_WDT and TASK_WDT mean the firmware died; BROWNOUT means the supply did. */
+static const char *reset_reason_str(esp_reset_reason_t r)
+{
+    switch (r) {
+        case ESP_RST_POWERON:  return "power on";
+        case ESP_RST_SW:       return "software restart (esp_restart)";
+        case ESP_RST_PANIC:    return "PANIC / exception";
+        case ESP_RST_INT_WDT:  return "INTERRUPT WATCHDOG";
+        case ESP_RST_TASK_WDT: return "TASK WATCHDOG";
+        case ESP_RST_WDT:      return "other watchdog";
+        case ESP_RST_BROWNOUT: return "BROWNOUT (supply sagged)";
+        case ESP_RST_DEEPSLEEP:return "deep sleep wake";
+        case ESP_RST_EXT:      return "external reset pin";
+        default:               return "unknown";
+    }
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "═══════════════════════════════════════════");
+    ESP_LOGI(TAG, "🚀 APC USB-MQTT Bridge Starting");
+    ESP_LOGI(TAG, "   Version: %s", FIRMWARE_VERSION);
+    ESP_LOGI(TAG, "   Build: %s", BUILD_TIMESTAMP);
+    /* Why the last boot happened. A board that restarts on its own tells you
+       nothing over the network — the ROM prints its rst: reason to UART only,
+       and the 80-line log ring has overwritten it long before anyone can fetch
+       /status. Chasing the v1.16.0 OTA failures came down to guessing between a
+       watchdog, a panic and a brownout with no way to tell them apart. */
+    ESP_LOGI(TAG, "   Last reset: %s", reset_reason_str(esp_reset_reason()));
+    ESP_LOGI(TAG, "═══════════════════════════════════════════");
+
+    // BOOT DELAY: Give 10 seconds to flash new firmware before USB host takes over
+    ESP_LOGW(TAG, "⏳ Boot delay: 10 seconds for firmware update window...");
+    for (int i = 10; i > 0; i--) {
+        ESP_LOGI(TAG, "⏱️  %d seconds remaining (press RESET to abort and stay in programming mode)", i);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    ESP_LOGI(TAG, "✅ Boot delay complete, continuing...");
+
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Load config from NVS (with Kconfig defaults as fallback)
+    config_load(&app_config);
+    ESP_LOGI(TAG, "📋 Config: WiFi=%s, MQTT=%s, Interval=%lums",
+             app_config.wifi_ssid, app_config.mqtt_url,
+             (unsigned long)app_config.publish_interval_ms);
+
+    // Initialize HID parser
+    apc_hid_parser_init();
+
+#if CONFIG_STATUS_LED_ENABLED
+    /* Starts in the slow red pulse; goes solid once WiFi is up. */
+    led_status_init();
+    led_status_set(LED_STATE_WIFI_DOWN);
+#endif
+
+    /* Two ways into the config portal: nothing was ever saved to NVS, or the
+     * saved network refuses us for WIFI_MAX_RETRY attempts. */
+    bool start_portal = false;
+
+    if (!app_config.provisioned) {
+        ESP_LOGW(TAG, "🛜  No saved config in NVS — starting SoftAP portal");
+        start_portal = true;
+    } else {
+        ESP_LOGI(TAG, "📶 Initializing WiFi...");
+        ESP_ERROR_CHECK(wifi_connect_sta(app_config.wifi_ssid, app_config.wifi_pass));
+
+        if (wifi_wait_connected(60000) != ESP_OK) {
+            ESP_LOGW(TAG, "🛜  Could not join \"%s\" — starting SoftAP portal",
+                     app_config.wifi_ssid);
+            start_portal = true;
+        }
+    }
+
+    if (start_portal) {
+        ESP_ERROR_CHECK(wifi_start_portal());
+        http_server_start(&app_config);
+        ESP_LOGW(TAG, "════════════ CONFIG PORTAL ════════════");
+        ESP_LOGW(TAG, "  Join open WiFi \"%s\"", wifi_portal_ssid());
+        ESP_LOGW(TAG, "  Then browse to http://192.168.4.1/");
+        ESP_LOGW(TAG, "  (any address redirects there)");
+        ESP_LOGW(TAG, "═══════════════════════════════════════");
+        return;   /* httpd + DNS tasks keep running; saving reboots the device */
+    }
+
+#if CONFIG_STATUS_LED_ENABLED
+    led_status_set(LED_STATE_WIFI_UP);   /* solid red: joined */
+#endif
+
+    // Start HTTP server (config UI + status/logs)
+    ESP_LOGI(TAG, "🌐 Starting HTTP server...");
+    http_server_start(&app_config);
+
+    // Initialize MQTT
+    ESP_LOGI(TAG, "📡 Initializing MQTT...");
+    ESP_ERROR_CHECK(mqtt_init(app_config.mqtt_url, app_config.mqtt_user, app_config.mqtt_pass,
+                              app_config.device_slug, app_config.device_name));
+    ESP_LOGI(TAG, "DEBUG: MQTT init complete");
+
+    // Initialize USB Host
+    ESP_LOGI(TAG, "DEBUG: About to init USB Host");
+    ESP_LOGI(TAG, "🔌 Initializing USB Host on GPIO19/20...");
+    esp_err_t usb_err = usb_host_init();
+    ESP_LOGI(TAG, "DEBUG: usb_host_init returned: 0x%x (%s)", usb_err, esp_err_to_name(usb_err));
+
+    if (usb_err == ESP_OK) {
+        ESP_LOGI(TAG, "✅ USB Host initialized, creating USB task");
+        xTaskCreate(usb_host_task, "usb_host", 4096, NULL, 5, NULL);
+    } else {
+        ESP_LOGW(TAG, "⚠️ USB Host init failed: %s, falling back to simulated data", esp_err_to_name(usb_err));
+        xTaskCreate(simulate_ups_data_task, "simulate_ups", 2048, NULL, 3, NULL);
+    }
+
+    ESP_LOGI(TAG, "DEBUG: USB setup complete, creating MQTT publish task");
+    // Create MQTT publish task
+    xTaskCreate(mqtt_publish_task, "mqtt_publish", 4096, NULL, 4, NULL);
+
+    ESP_LOGI(TAG, "=== ✅ APC USB-MQTT Bridge Running ===");
+    ESP_LOGI(TAG, "WiFi: Connected to %s", app_config.wifi_ssid);
+    ESP_LOGI(TAG, "MQTT Broker: %s", app_config.mqtt_url);
+    ESP_LOGI(TAG, "🌐 Web UI: http://<device-ip>/  Status: http://<device-ip>/status");
+#ifdef DISABLE_USB_HOST
+    ESP_LOGW(TAG, "🐛 DEBUG MODE: USB Host disabled, using simulated data only");
+#endif
+}

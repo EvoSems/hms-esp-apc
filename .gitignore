@@ -1,0 +1,20 @@
+build/
+build-n8r8/
+sdkconfig
+sdkconfig.old
+*.o
+*.elf
+*.bin
+*.map
+
+# clangd index
+.cache/
+
+# left behind by running the scripts in .github/scripts/
+__pycache__/
+
+# local bench credentials — never commit
+sdkconfig.local.defaults
+
+# fetched by the IDF component manager
+managed_components/

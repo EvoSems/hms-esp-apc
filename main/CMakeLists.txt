@@ -1,0 +1,30 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "wifi_manager.c"
+        "mqtt_manager.c"
+        "apc_hid_parser.c"
+        "hid_pdc.c"
+        "ups_map.c"
+        "usb_host_manager.c"
+        "hid_debug.c"
+        "http_server.c"
+        "dns_hijack.c"
+        "led_status.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        usb
+    PRIV_REQUIRES
+        driver
+        mqtt
+        esp_hid
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        esp_timer
+        esp_http_server
+        app_update
+        esp_partition
+)
